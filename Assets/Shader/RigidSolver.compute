@@ -1,0 +1,652 @@
+﻿//uniform data here
+uint nodeCount;
+uint triCount;
+uint numberObj;
+uint octree_size;
+bool debugBox;
+bool debugTri;
+float dt;
+float invMass;
+
+float3 hitPoint;
+#define Epsilon 0.00001
+
+struct vertData
+{
+    float3 pos;
+    float2 uvs;
+    float3 norms;
+};
+struct Triangle
+{
+    uint v0;
+    uint v1;
+    uint v2;
+};
+
+struct BoundingBox
+{
+    float3 min;
+    float3 max;
+};
+
+struct OctreeData
+{
+    float3 min;
+    float3 max;
+    float3 center;
+};
+
+struct PairIndex
+{
+    uint i1;
+    uint i2;
+};
+
+struct Tri
+{
+    float3 vertex0;
+    float3 vertex1;
+    float3 vertex2;
+};
+
+struct Line
+{
+    float3 p0;
+    float3 p1;
+
+    float3 direction;
+    float3 origin;
+};
+
+struct TriRelation
+{
+    uint boxSize[6];
+};
+
+
+// Update Tri AABB Relation
+RWStructuredBuffer<TriRelation> triAABBRelation;
+
+// Update pos and vel
+RWStructuredBuffer<float3> Positions;
+RWStructuredBuffer<float3> Velocities;
+
+// vertices normal
+RWStructuredBuffer<vertData> vertsBuff;
+RWStructuredBuffer<Triangle> Triangles;
+RWStructuredBuffer<uint> TrianglePtr;
+
+// floor min and max
+RWStructuredBuffer<float3> floorPositions;
+RWStructuredBuffer<BoundingBox> floorBB;
+
+// BB min and max
+RWStructuredBuffer<BoundingBox> bbMinMax;
+StructuredBuffer<int2> ObjectIndex;
+RWStructuredBuffer<uint> floorCollisionResults;
+
+// Octree Data
+RWStructuredBuffer<OctreeData> bbOctree;
+RWStructuredBuffer<PairIndex> pairIndexLv2;
+RWStructuredBuffer<uint> collisionBox;
+
+// Tri position
+RWStructuredBuffer<Tri> posTriangles;
+RWStructuredBuffer<uint> triArray;
+
+// Tri-Intersection
+RWStructuredBuffer<int2> collisionTri;
+
+// CheckBoundingBoxCollisions (texture)
+RWTexture2D<int> collisionResults;
+
+#pragma kernel FindTriAABBRelation
+#pragma kernel computeVerticesNormal
+#pragma kernel FindPosTriangles
+#pragma kernel UpdatePosKernel
+#pragma kernel FindFloorMinMax
+#pragma kernel FindBBMinMax
+#pragma kernel UpdateReverseVelocity
+#pragma kernel ImplementOctree
+#pragma kernel RemoveCollisionResults
+#pragma kernel TriIntersection
+#pragma kernel RemoveTriKernel
+#pragma kernel CheckBoundingBoxCollisions
+
+
+bool CheckTriContainsBox(float3 triVec3, uint i)
+{
+    float3 minPos = float3(0,0,0);
+    float3 maxPos = float3(0,0,0);
+    minPos = bbOctree[i].min;
+    maxPos = bbOctree[i].max;
+
+    if( triVec3.x >= minPos.x && triVec3.x <= maxPos.x &&
+        triVec3.y >= minPos.y && triVec3.y <= maxPos.y &&            
+        triVec3.z >= minPos.z && triVec3.z <= maxPos.z)
+        return true;
+        
+        
+    return false;
+}
+
+[numthreads(1024, 1, 1)]
+void FindTriAABBRelation(uint3 id : SV_DispatchThreadID) {
+    uint idx = id.x;
+
+    if (idx >= triCount) return;
+
+    uint maxBoxSize = 6;
+    for(uint i=0; i < maxBoxSize; i++)
+    { 
+        triAABBRelation[idx].boxSize[i] = -1;
+    } 
+
+    uint boxCount=0;
+
+    for(uint i=0; i< numberObj * octree_size; i++)
+    {
+        // if(i % octree_size == 0) return;
+        if(i % octree_size != 0) 
+        {
+
+            if (
+                CheckTriContainsBox(Positions[triArray[idx * 3 + 0]], i) ||
+                CheckTriContainsBox(Positions[triArray[idx * 3 + 1]], i) ||
+                CheckTriContainsBox(Positions[triArray[idx * 3 + 2]], i) )
+                {
+                    triAABBRelation[idx].boxSize[boxCount] = i;   
+                    boxCount++;             
+                }  
+            }
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void computeVerticesNormal(uint3 i : SV_DispatchThreadID) {
+    if (i.x >= nodeCount) return;
+
+    float3 norm = float3(0, 0, 0);
+    uint start = TrianglePtr[i.x];
+    uint end = TrianglePtr[i.x + 1];
+
+    for (uint j = start; j < end; j++) {
+        Triangle t = Triangles[j];
+        float3 v1 = Positions[t.v0];
+        float3 v2 = Positions[t.v1];
+        float3 v3 = Positions[t.v2];
+
+        float3 N = cross(v2 - v1, v3 - v1);
+        norm += N;
+    }
+    vertsBuff[i.x].norms = normalize(norm);
+}
+
+
+
+
+[numthreads(1024, 1, 1)]
+void FindPosTriangles(uint3 i : SV_DispatchThreadID) {
+    uint id = i.x;
+    if (id >= triCount) return;
+
+    float3 v1 = Positions[triArray[id * 3 + 0]];
+    float3 v2 = Positions[triArray[id * 3 + 1]];
+    float3 v3 = Positions[triArray[id * 3 + 2]];
+
+    posTriangles[id].vertex0 = v1;
+    posTriangles[id].vertex1 = v2;
+    posTriangles[id].vertex2 = v3;
+}
+
+
+[numthreads(1024, 1, 1)]
+void UpdatePosKernel(uint3 i : SV_DispatchThreadID) {
+    if (i.x >= nodeCount) return;
+
+    float3 gravity = float3(0.0f, -9.81f, 0.0f);
+    float3 position = Positions[i.x];
+    float3 velocity = Velocities[i.x];
+
+    velocity = velocity + gravity * invMass * dt;
+    position = position + velocity * dt;
+    Positions[i.x] = position;
+    Velocities[i.x] = velocity;
+
+    vertsBuff[i.x].pos = Positions[i.x];
+}
+
+
+[numthreads(1, 1, 1)]
+void FindFloorMinMax(uint3 i : SV_DispatchThreadID)
+{
+    uint idx = i.x;
+
+    float3 minValue = floorPositions[0];
+    float3 maxValue = floorPositions[0];
+
+    for (uint i = 0; i < floorPositions.Length; i++)
+    {
+        float3 vertex = floorPositions[i];
+
+        minValue = min(minValue, vertex); // 최소값 업데이트
+        maxValue = max(maxValue, vertex); // 최대값 업데이트
+    }
+    maxValue.y += 0.1f;
+
+    floorBB[idx].min = minValue;
+    floorBB[idx].max = maxValue;
+}
+
+[numthreads(1024, 1, 1)]
+void FindBBMinMax(uint3 i : SV_DispatchThreadID)
+{
+    uint idx = i.x;
+
+    if (idx >= numberObj) return;
+
+    uint start = ObjectIndex[idx].x;
+    uint end = ObjectIndex[idx].y; 
+
+    float3 min_value = Positions[start]; // 0 24
+    float3 max_value = Positions[start]; // 0 24
+
+    for (uint i = start; i < end; i++) // 0 < 24
+    {
+        float3 vertex = Positions[i];
+
+        min_value = min(min_value, vertex); // 최소값 업데이트
+        max_value = max(max_value, vertex); // 최대값 업데이트
+    }
+
+    bbMinMax[idx].min = min_value;
+    bbMinMax[idx].max = max_value;
+
+    bool collides =
+    bbMinMax[idx].min.x <= floorBB[0].max.x &&
+    bbMinMax[idx].max.x >= floorBB[0].min.x &&
+    bbMinMax[idx].min.y <= floorBB[0].max.y &&
+    bbMinMax[idx].max.y >= floorBB[0].min.y &&
+    bbMinMax[idx].min.z <= floorBB[0].max.z &&
+    bbMinMax[idx].max.z >= floorBB[0].min.z;
+
+    floorCollisionResults[idx] = collides ? 1 : 0;
+}
+
+
+[numthreads(1024, 1, 1)]
+void UpdateReverseVelocity(uint3 i : SV_DispatchThreadID)
+{
+    uint idx = i.x;
+
+    if (idx >= nodeCount) return;
+    
+    for (uint j = 0; j < numberObj; j++) {
+        if (floorCollisionResults[j] == 1) {
+            uint start = ObjectIndex[j].x;
+            uint end = ObjectIndex[j].y; 
+            // float penetrationPos = 0;
+            
+            if (idx >= start && idx < end) {
+                
+                Velocities[idx] *= -1;
+                Positions[idx].y += 0.1f;
+            }
+        }
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void ImplementOctree(uint3 i : SV_DispatchThreadID)
+{
+    uint idx = i.x;
+
+    if (idx >= numberObj ) return;
+
+    // Lv0, Initialize Lv0 
+    bbOctree[idx * octree_size].center = (bbMinMax[idx].max + bbMinMax[idx].min) / 2;
+    bbOctree[idx * octree_size].min = bbMinMax[idx].min; // min value Lv0
+    bbOctree[idx * octree_size].max = bbMinMax[idx].max; // max value Lv0
+
+    float3 center = bbOctree[idx * octree_size].center;
+    float3 size = bbOctree[idx * octree_size].max - bbOctree[idx * octree_size].min;
+
+    // Lv1, Split to 8 children
+    bbOctree[idx * octree_size + 1].center.x = center.x - (size.x / 4);
+    bbOctree[idx * octree_size + 1].center.y = center.y + (size.y / 4);
+    bbOctree[idx * octree_size + 1].center.z = center.z - (size.z / 4);
+
+    bbOctree[idx * octree_size + 2].center.x = center.x + (size.x / 4);
+    bbOctree[idx * octree_size + 2].center.y = center.y + (size.y / 4);
+    bbOctree[idx * octree_size + 2].center.z = center.z - (size.z / 4);
+
+    bbOctree[idx * octree_size + 3].center.x = center.x - (size.x / 4);
+    bbOctree[idx * octree_size + 3].center.y = center.y - (size.y / 4);
+    bbOctree[idx * octree_size + 3].center.z = center.z - (size.z / 4);
+
+    bbOctree[idx * octree_size + 4].center.x = center.x + (size.x / 4);
+    bbOctree[idx * octree_size + 4].center.y = center.y - (size.y / 4);
+    bbOctree[idx * octree_size + 4].center.z = center.z - (size.z / 4);
+
+    bbOctree[idx * octree_size + 5].center.x = center.x - (size.x / 4);
+    bbOctree[idx * octree_size + 5].center.y = center.y + (size.y / 4);
+    bbOctree[idx * octree_size + 5].center.z = center.z + (size.z / 4);
+
+    bbOctree[idx * octree_size + 6].center.x = center.x + (size.x / 4);
+    bbOctree[idx * octree_size + 6].center.y = center.y + (size.y / 4);
+    bbOctree[idx * octree_size + 6].center.z = center.z + (size.z / 4);
+
+    bbOctree[idx * octree_size + 7].center.x = center.x - (size.x / 4);
+    bbOctree[idx * octree_size + 7].center.y = center.y - (size.y / 4);
+    bbOctree[idx * octree_size + 7].center.z = center.z + (size.z / 4);
+
+    bbOctree[idx * octree_size + 8].center.x = center.x + (size.x / 4);
+    bbOctree[idx * octree_size + 8].center.y = center.y - (size.y / 4);
+    bbOctree[idx * octree_size + 8].center.z = center.z + (size.z / 4);
+    
+    for (uint j = 1; j <= 8; j++)
+    {
+        uint il1 = idx * octree_size + j;
+        // Lv1, min and max
+        bbOctree[il1].min.x = bbOctree[il1].center.x - (size.x / 4);
+        bbOctree[il1].min.y = bbOctree[il1].center.y - (size.y / 4);
+        bbOctree[il1].min.z = bbOctree[il1].center.z - (size.z / 4);
+
+        bbOctree[il1].max.x = bbOctree[il1].center.x + (size.x / 4);
+        bbOctree[il1].max.y = bbOctree[il1].center.y + (size.y / 4);
+        bbOctree[il1].max.z = bbOctree[il1].center.z + (size.z / 4);
+    }
+}
+
+
+[numthreads(1024, 1, 1)]
+void RemoveCollisionResults(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+
+    if(idx >= numberObj * octree_size) return;
+    collisionBox[idx] = 0;
+}
+
+///////////// Tri-Intersection function ////////////
+float3 ProjectPointOnPlane(float3 p, float3 planeNormal, float3 planePoint)
+{
+    float d = dot(planeNormal, (p - planePoint)) / length(planeNormal) ;
+    return p - d * planeNormal;
+}
+
+bool IsPointInsideTriangle(float3 p, Tri tri)
+{
+    float3 normal = normalize(cross(tri.vertex1 - tri.vertex0, tri.vertex2 - tri.vertex0));
+
+    // ���� �ﰢ�� ��鿡 ����
+    float3 projectedPoint = ProjectPointOnPlane(p, normal, tri.vertex0);
+
+    //if (distance(projectedPoint, p) > 0.1) return false;
+    if (distance(projectedPoint, p) > 0.01) return false;
+
+    // ������ ���� ���� ���� �Ǵ� ����
+    float3 edge1 = tri.vertex1 - tri.vertex0;
+    float3 vp1 = projectedPoint - tri.vertex0;
+    if (dot(cross(edge1, vp1), normal) < 0) return false;
+
+    float3 edge2 = tri.vertex2 - tri.vertex1;
+    float3 vp2 = projectedPoint - tri.vertex1;
+    if (dot(cross(edge2, vp2), normal) < 0) return false;
+
+    float3 edge3 = tri.vertex0 - tri.vertex2;
+    float3 vp3 = projectedPoint - tri.vertex2;
+    if (dot(cross(edge3, vp3), normal) < 0) return false;
+
+    return true; // ��� �˻縦 ����ߴٸ�, ������ ���� �ﰢ�� ���ο� �ֽ��ϴ�.
+}
+
+bool Intersect(Tri tri, Line ray, float3 hit)
+{
+    // Vectors from p1 to p2/p3 (edges)
+    //Find vectors for edges sharing vertex/point p1
+    float3 e1 = tri.vertex1 - tri.vertex0;
+    float3 e2 = tri.vertex2 - tri.vertex0;
+
+    ray.direction = normalize(ray.p1 - ray.p0);
+    float3 p = cross(ray.direction, e2);
+
+    //Calculate determinat
+    float det = dot(e1, p);
+
+    //if determinant is near zero, ray lies in plane of triangle otherwise not
+    //if (det > -Mathf.Epsilon && det < Mathf.Epsilon)
+    if (det > -Epsilon && det < Epsilon)
+    {
+        bool coplanar = IsPointInsideTriangle(ray.p0, tri);
+        bool coplanar2 = IsPointInsideTriangle(ray.p1, tri);
+
+        if (coplanar) hit = ray.p0;
+        if (coplanar2) hit = ray.p1;
+
+        return coplanar || coplanar2;
+    }
+    float invDet = 1.0f / det;
+
+    //calculate distance from p1 to ray origin
+    ray.origin = ray.p0;
+    float3 t = ray.origin - tri.vertex0;
+
+    //Calculate u parameter
+    float u = dot(t, p) * invDet;
+
+    //Check for ray hit
+    if (u < 0 || u > 1) { return false; }
+
+    //Prepare to test v parameter
+    float3 q = cross(t, e1);
+
+    //Calculate v parameter
+    float v = dot(ray.direction, q) * invDet;
+
+    //Check for ray hit
+    if (v < 0 || u + v > 1) { return false; }
+
+    // intersection point
+    hit = tri.vertex0 + u * e1 + v * e2;
+
+    if ((dot(e2, q) * invDet) > Epsilon)
+    {
+        //ray does intersect            
+        return true;
+    }
+
+    // No hit at all
+    return false;
+}
+
+bool CheckEdgeCollision(float3 vertex1, float3 vertex2, Tri t)
+{
+    //var edge = new Line();
+    // Instantiate a Line struct
+    Line edge;
+
+    edge.p0 = vertex1;
+    edge.p1 = vertex2;
+
+    return Intersect(t, edge,  hitPoint);
+}
+
+bool Detection(Tri t1, Tri t2)
+{
+    bool c1 = 
+    CheckEdgeCollision(t1.vertex0, t1.vertex1, t2) || 
+    CheckEdgeCollision(t1.vertex0, t1.vertex2, t2) || 
+    CheckEdgeCollision(t1.vertex1, t1.vertex2, t2);
+
+    bool c2 = 
+    CheckEdgeCollision(t2.vertex0, t2.vertex1, t1) || 
+    CheckEdgeCollision(t2.vertex0, t2.vertex2, t1) || 
+    CheckEdgeCollision(t2.vertex1, t2.vertex2, t1);
+
+    return c1 && c2;
+}
+
+uint calcIndexObjectLevel0(uint object_index)
+{
+    uint level = floor(float(object_index) / octree_size);
+
+    if (level != 0) return level * octree_size;
+    return floor(float(object_index) / octree_size);
+}
+
+bool BBCollision(OctreeData boxA, OctreeData boxB)
+{
+    return 
+    boxA.min.x <= boxB.max.x &&
+    boxA.max.x >= boxB.min.x &&
+    boxA.min.y <= boxB.max.y &&
+    boxA.max.y >= boxB.min.y &&
+    boxA.min.z <= boxB.max.z &&
+    boxA.max.z >= boxB.min.z;
+}
+
+
+[numthreads(32, 32, 1)]
+void TriIntersection(uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= triCount) return;
+
+    uint i = id.x;
+    uint j = id.y;
+    
+    uint objIndex1 = floor(float(i) / (triCount / numberObj));
+    uint objIndex2 = floor(float(j) / (triCount / numberObj));
+
+    if(objIndex1 == objIndex2) return;
+
+    // if(BBCollision(bbOctree[objIndex1 * octree_size],
+    //         bbOctree[objIndex2 * octree_size]) == false)
+    //     {
+    //         return;
+    //     }
+
+    // OctreeData boxA = bbOctree[objIndex1 * octree_size];
+    // OctreeData boxB = bbOctree[objIndex2 * octree_size];
+
+    // bool intersects =
+    //         boxA.min.x <= boxB.max.x &&
+    //         boxA.max.x >= boxB.min.x &&
+    //         boxA.min.y <= boxB.max.y &&
+    //         boxA.max.y >= boxB.min.y &&
+    //         boxA.min.z <= boxB.max.z &&
+    //         boxA.max.z >= boxB.min.z;
+
+    // //check 0
+    // uint2 coord = uint2(objIndex1 * octree_size, objIndex2 * octree_size);
+    // if(collisionResults[coord]==0) return;
+
+    // //check 1 (add tri-box pair information)
+    // for(a in tri-box)
+    //     for(b in tri-box)
+    //     any pair is coolide -> go check
+    //     every pair are doesn't collide -> return
+
+    //for(uint p = 0; p<triAABBRelation[id.x].boxSize.length; p++)
+    //{}
+
+    if(objIndex1 != objIndex2 )
+    {
+
+         //check 0
+        // uint2 coord = uint2(objIndex1 * octree_size, objIndex2 * octree_size);
+        // if(collisionResults[coord]==0) return;
+
+        if(BBCollision(bbOctree[objIndex1 * octree_size],
+            bbOctree[objIndex2 * octree_size]) == false)
+        {
+            return;
+        }
+
+        // else
+        // {
+        //     collisionBox[objIndex1 * octree_size] = 1;
+        //     collisionBox[objIndex2 * octree_size] = 1;
+        // }
+
+        // for(int k = 0; k< triAABBRelation[i].boxSize.Length; k++)
+        // {
+        //     for(int l =0;l<triAABBRelation[j].boxSize.Length;l++)
+        //     {
+        //         if(triAABBRelation[i].boxSize[k] != -1 && triAABBRelation[j].boxSize[l] != -1)
+        //         {
+        //             if(BBCollision(bbOctree[triAABBRelation[i].boxSize[k]], 
+        //                 bbOctree[triAABBRelation[j].boxSize[l]]) == false)
+        //             {
+        //                 return;
+        //             }
+        //         }                
+        //     }
+        // }
+
+        Tri t1 = posTriangles[i];
+        Tri t2 = posTriangles[j];
+
+        // if(collisionResults[objIndex1, objIndex2]  == 1)
+        {
+            // check triangle
+            if(Detection(t1, t2))
+            {        
+                if(debugTri)
+                {
+                    collisionTri[i] = 1;
+                    collisionTri[j] = 1;
+                } 
+            }
+        }
+    }
+}
+
+
+
+[numthreads(1024, 1, 1)]
+void RemoveTriKernel(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= triCount * numberObj) return;
+
+    collisionTri[id.x] = 0;
+}
+
+
+[numthreads(32, 32, 1)]
+void CheckBoundingBoxCollisions(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint idy = id.y;
+
+    if(idx == idy) return;
+
+    // my case : only contains level 1(object * 8)
+    int startA = idx * octree_size;
+    int endA = (idx+1) * octree_size;
+    
+    int startB = idy * octree_size;
+    int endB = (idy+1) * octree_size;
+
+   for (int i = startA; i < endA; i++)
+    {
+        OctreeData boxA = bbOctree[i];
+        for (int j = startB; j < endB; j++)
+        {
+            OctreeData boxB = bbOctree[j];
+            bool intersects = BBCollision(boxA, boxB);
+
+            // bool intersects =
+            // boxA.min.x <= boxB.max.x &&
+            // boxA.max.x >= boxB.min.x &&
+            // boxA.min.y <= boxB.max.y &&
+            // boxA.max.y >= boxB.min.y &&
+            // boxA.min.z <= boxB.max.z &&
+            // boxA.max.z >= boxB.min.z;
+        
+            uint2 coord = uint2(i, j);
+            collisionResults[coord] = intersects ? 1 : 0;
+        }
+    }
+}
